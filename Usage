@@ -1,0 +1,151 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+# =========================
+# Input arguments
+# =========================
+my ($fastq_R1, $fastq_R2, $samplename) = @ARGV;
+
+die "Usage: perl pipeline.pl <R1.fastq.gz> <R2.fastq.gz> <sample_name>\n"
+    unless @ARGV == 3;
+
+print "Input Files:\n$fastq_R1\n$fastq_R2\nSample: $samplename\n";
+
+# =========================
+# Start pipeline
+# =========================
+print "Pipeline started\n";
+system("date > pipeline.starttime.log");
+
+# =========================
+# Adapter Trimming
+# =========================
+print "Adapter trimming started\n";
+system("date > adapter.time.log");
+
+system("$FASTQMCF -x 10 -q 20 -l 30 -S -k 0 "
+    . "-o $samplename.AT.R1.fastq.gz "
+    . "-o $samplename.AT.R2.fastq.gz "
+    . "$ADPATERS $fastq_R1 $fastq_R2");
+
+system("date >> adapter.time.log");
+
+# =========================
+# Human Contamination Removal
+# =========================
+print "Human DNA contamination removal (BWA)\n";
+system("date > cont.timelog");
+
+system("$BWA mem $HG_REF -t 30 "
+    . "-R '\\@RG\\tID:$samplename\\tSM:$samplename\\tPL:illumina' "
+    . "$samplename.AT.R1.fastq.gz $samplename.AT.R2.fastq.gz "
+    . "> $samplename.con.sam");
+
+system("$SAMTOOLS view -bS -@ 8 $samplename.con.sam -o $samplename.con.bam");
+system("$SAMTOOLS sort -@ 8 $samplename.con.bam -T $samplename.sorted -o $samplename.con.sorted.bam");
+system("$SAMTOOLS index $samplename.con.sorted.bam");
+system("$SAMTOOLS flagstat $samplename.con.sorted.bam > $samplename.con.alnstats.txt");
+
+# Extract unmapped reads
+system("$SAMTOOLS view -h -f 4 $samplename.con.sorted.bam -o $samplename.con.unmapped.bam");
+system("$SAMTOOLS sort -n $samplename.con.unmapped.bam -T $samplename.unmapped -o $samplename.con.unmappedsort.bam");
+
+system("bamToFastq -i $samplename.con.unmappedsort.bam "
+    . "-fq $samplename.UC.R1.fastq.gz "
+    . "-fq2 $samplename.UC.R2.fastq.gz > fq.log");
+
+system("rm $samplename.con.unmappedsort.bam");
+system("date >> cont.timelog");
+
+# =========================
+# De novo Assembly (MEGAHIT)
+# =========================
+print "De novo assembly using MEGAHIT\n";
+
+system("gunzip -c $samplename.UC.R1.fastq.gz > $samplename.UC.R1.fastq");
+system("gunzip -c $samplename.UC.R2.fastq.gz > $samplename.UC.R2.fastq");
+
+system("date > runtime.megahit.log");
+system("$MEGAHIT -1 $samplename.UC.R1.fastq -2 $samplename.UC.R2.fastq "
+    . "-m 0.7 -t 30 -o $samplename.assembly");
+system("date >> runtime.megahit.log");
+
+system("cp $samplename.assembly/final.contigs.fa .");
+print "Assembly completed\n";
+
+# =========================
+# Back Referencing
+# =========================
+print "Back-referencing using BWA\n";
+system("date > runtime.backref.log");
+
+system("$BWA index final.contigs.fa");
+
+system("$BWA mem final.contigs.fa -t 30 "
+    . "-R '\\@RG\\tID:$samplename\\tSM:$samplename\\tPL:illumina' "
+    . "$samplename.UC.R1.fastq $samplename.UC.R2.fastq "
+    . "> $samplename.backref.sam");
+
+system("$SAMTOOLS view -bS -@ 8 $samplename.backref.sam > $samplename.backref.bam");
+system("$SAMTOOLS sort -@ 8 $samplename.backref.bam -T $samplename.backref.sorted -o $samplename.backref.sorted.bam");
+system("$SAMTOOLS index $samplename.backref.sorted.bam");
+system("$SAMTOOLS flagstat $samplename.backref.sorted.bam > backref.log");
+
+system("date >> runtime.backref.log");
+print "Back-referencing completed\n";
+
+# =========================
+# Assembly QC (MetaQUAST)
+# =========================
+print "Running MetaQUAST\n";
+
+system("date > runtime.metaquast.log");
+system("$METAQUAST final.contigs.fa -a all -r $BACT_REF --mgm -o $samplename.report");
+system("date >> runtime.metaquast.log");
+
+# =========================
+# Gene Prediction (Prodigal)
+# =========================
+print "Gene prediction using Prodigal\n";
+
+system("$PRODIGAL -a $samplename.trans_file "
+    . "-c -d $samplename.nuc_file.fasta "
+    . "-i final.contigs.fa -o $samplename.genes -p meta");
+
+# =========================
+# ORF Filtering
+# =========================
+print "Filtering ORFs and calculating frequencies\n";
+
+system("perl $EXTRACT $samplename.nuc_file.fasta > ORF.filtered.ffn");
+system("python calc_length_freq.py ORF.filtered.ffn > ORF.filtered.txt");
+
+print "Columns: Total genes | >200bp | 500-1000bp | >1000bp\n";
+
+# =========================
+# DIAMOND BLASTx
+# =========================
+print "Running DIAMOND BLASTx\n";
+
+system("$DIAMOND blastx -d $NR_DB "
+    . "-q ORF.filtered.ffn "
+    . "--max-target-seqs 1 -f tab -p 30 -e 1e-5 "
+    . "--out ${samplename}_Blastx_out.txt "
+    . "-t /dev/shm -c 1");
+
+# =========================
+# MEGAN Analysis
+# =========================
+print "MEGAN RMA conversion\n";
+
+system("$BLAST2RMA -i ${samplename}_Blastx_out.txt "
+    . "--format BlastTab "
+    . "-o ${samplename}_Blastx.rma "
+    . "-c -mdb $MEGAN_MAP");
+
+system("perl $FETCH_TAXA ${samplename}_Blastx.rma $samplename");
+system("sh $Make_Tax_Percent ${samplename}_Taxonomy.txt $samplename");
+
+print "Pipeline completed successfully\n";
